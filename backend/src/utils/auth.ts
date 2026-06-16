@@ -14,3 +14,11 @@ const JWT_SECRET = getJwtSecret();
 export function createToken(userId: string): string {
   return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "7d" });
 }
+
+export interface TokenPayload {
+  userId: string;
+}
+
+export function verifyToken(token: string): TokenPayload {
+  return jwt.verify(token, JWT_SECRET) as TokenPayload;
+}
