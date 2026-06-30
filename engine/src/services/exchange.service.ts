@@ -114,16 +114,75 @@ export function getFills(symbol: string): Fill[] {
     .slice(0, 50); // return only recent trades not all to be shown
 }
 
-export function createOrder(input: CreateOrderInput): OrderRecord {
-  if (input.type !== "limit") {
-    throw new Error("Market orders are not implemented yet");
+export function cancelOrder(userId: string, orderId: string): OrderRecord {
+  const order = getOrder(userId, orderId);
+
+  if (order.status === "cancelled") {
+    throw new Error("Order already cancelled");
   }
 
+  if (order.status === "filled") {
+    throw new Error("Filled order cannot be cancelled");
+  }
+
+  if (order.type !== "limit" || order.price === null) {
+    throw new Error("Only resting limit orders can be cancelled");
+  }
+
+  const remainingQty = order.qty - order.filledQty;
+  if (remainingQty <= 0) {
+    throw new Error("Order has no remaining quantity");
+  }
+
+  const orderBook = ORDERBOOKS.get(order.symbol);
+  if (!orderBook) {
+    throw new Error("Order book missing");
+  }
+
+  const bookSide = order.side === "buy" ? orderBook.bids : orderBook.asks;
+  const priceLevel = bookSide.get(order.price);
+
+  if (!priceLevel) {
+    throw new Error("Order is not resting on book");
+  }
+
+  const activeOrders = priceLevel.filter(
+    (restingOrder) => restingOrder.orderId !== order.orderId,
+  );
+
+  if (activeOrders.length === priceLevel.length) {
+    throw new Error("Order is not resting on book");
+  }
+
+  if (activeOrders.length === 0) {
+    bookSide.delete(order.price);
+  } else {
+    bookSide.set(order.price, activeOrders);
+  }
+
+  unlockRemainingReservation(order, remainingQty);
+  order.status = "cancelled";
+
+  return order;
+}
+
+export function createOrder(input: CreateOrderInput): OrderRecord {
   assertStockExists(input.symbol);
   const balances = getUserBalance(input.userId);
+  let marketBuyRemainingSpend =
+    input.type === "market" && input.side === "buy" ? (input.maxSpend ?? 0) : 0;
 
   if (input.side === "buy") {
-    const requiredMoney = input.price * input.qty;
+    if (input.type === "limit" && input.price === null) {
+      throw new Error("price is required for limit orders");
+    }
+
+    if (input.type === "market" && !input.maxSpend) {
+      throw new Error("maxSpend is required for market buy orders");
+    }
+
+    const requiredMoney =
+      input.type === "limit" ? input.price! * input.qty : (input.maxSpend ?? 0);
     const availableMoney = balances.INR;
 
     if (!availableMoney) {
@@ -136,11 +195,6 @@ export function createOrder(input: CreateOrderInput): OrderRecord {
 
     availableMoney.available -= requiredMoney;
     availableMoney.locked += requiredMoney;
-
-    const bestPrice = bestAskPrice(input.symbol);
-    if (bestPrice && bestPrice.price <= input.price) {
-      console.log("Buy order can match with ask: ", bestPrice);
-    }
   }
 
   if (input.side === "sell") {
@@ -155,11 +209,6 @@ export function createOrder(input: CreateOrderInput): OrderRecord {
 
     assetBalance.available -= input.qty;
     assetBalance.locked += input.qty;
-
-    const bestPrice = bestBidPrice(input.symbol);
-    if (bestPrice && bestPrice.price >= input.price) {
-      console.log("Sell order can match with bid: ", bestPrice);
-    }
   }
 
   const order: OrderRecord = {
@@ -177,6 +226,182 @@ export function createOrder(input: CreateOrderInput): OrderRecord {
   };
 
   ORDERS.set(order.orderId, order);
+
+  if (input.side === "buy") {
+    while (order.qty - order.filledQty > 0) {
+      const bestPrice = bestAskPrice(input.symbol);
+
+      if (!bestPrice) break;
+      if (input.type === "limit") {
+        if (input.price === null) {
+          throw new Error("price is required for limit orders");
+        }
+
+        if (bestPrice.price > input.price) break;
+      }
+
+      if (input.type === "market" && marketBuyRemainingSpend <= 0) break;
+
+      const restingOrder = bestPrice.orders[0];
+
+      if (!restingOrder) throw new Error("Resting order not available");
+
+      const incomingRemaining = order.qty - order.filledQty;
+      const restingRemaining = restingOrder.qty - restingOrder.filledQty;
+      let tradeQty = Math.min(incomingRemaining, restingRemaining);
+
+      if (input.type === "market") {
+        const maxAffordableQty = marketBuyRemainingSpend / bestPrice.price;
+        tradeQty = Math.min(tradeQty, maxAffordableQty);
+
+        if (tradeQty <= 0) break;
+
+        marketBuyRemainingSpend -= bestPrice.price * tradeQty;
+      }
+
+      order.filledQty += tradeQty;
+      restingOrder.filledQty += tradeQty;
+
+      const restingOrderRecord = ORDERS.get(restingOrder.orderId);
+      if (!restingOrderRecord) {
+        throw new Error("Resting order record missing");
+      }
+
+      restingOrderRecord.filledQty += tradeQty;
+
+      updateOrderStatus(order);
+      updateOrderStatus(restingOrderRecord);
+      restingOrder.status = restingOrderRecord.status;
+
+      const fill: Fill = {
+        fillId: crypto.randomUUID(),
+        symbol: input.symbol,
+        price: bestPrice.price,
+        qty: tradeQty,
+        buyOrderId: order.orderId,
+        sellOrderId: restingOrder.orderId,
+        createdAt: Date.now(),
+      };
+
+      FILLS.push(fill);
+      order.fills.push(fill);
+      restingOrderRecord.fills.push(fill);
+
+      settleFill({
+        buyerUserId: order.userId,
+        sellerUserId: restingOrder.userId,
+        symbol: input.symbol,
+        tradePrice: bestPrice.price,
+        tradeQty,
+        buyerLockedRelease:
+          input.type === "limit"
+            ? input.price! * tradeQty
+            : bestPrice.price * tradeQty,
+      });
+
+      const orderBook = ORDERBOOKS.get(input.symbol);
+      if (!orderBook) {
+        throw new Error("Order book missing");
+      }
+
+      cleanupPriceLevel(orderBook.asks, bestPrice.price);
+    }
+  }
+
+  if (input.side === "sell") {
+    while (order.qty - order.filledQty > 0) {
+      const bestPrice = bestBidPrice(input.symbol);
+
+      if (!bestPrice) break;
+      if (input.type === "limit") {
+        if (input.price === null) {
+          throw new Error("price is required for limit orders");
+        }
+
+        if (bestPrice.price < input.price) break;
+      }
+
+      const restingOrder = bestPrice.orders[0];
+
+      if (!restingOrder) throw new Error("Resting order not available");
+
+      const incomingRemaining = order.qty - order.filledQty;
+      const restingRemaining = restingOrder.qty - restingOrder.filledQty;
+      const tradeQty = Math.min(incomingRemaining, restingRemaining);
+      order.filledQty += tradeQty;
+      restingOrder.filledQty += tradeQty;
+
+      const restingOrderRecord = ORDERS.get(restingOrder.orderId);
+      if (!restingOrderRecord) {
+        throw new Error("Resting order record missing");
+      }
+
+      restingOrderRecord.filledQty += tradeQty;
+
+      updateOrderStatus(order);
+      updateOrderStatus(restingOrderRecord);
+      restingOrder.status = restingOrderRecord.status;
+
+      const fill: Fill = {
+        fillId: crypto.randomUUID(),
+        symbol: input.symbol,
+        price: bestPrice.price,
+        qty: tradeQty,
+        buyOrderId: restingOrder.orderId,
+        sellOrderId: order.orderId,
+        createdAt: Date.now(),
+      };
+
+      FILLS.push(fill);
+      order.fills.push(fill);
+      restingOrderRecord.fills.push(fill);
+
+      settleFill({
+        buyerUserId: restingOrder.userId,
+        sellerUserId: order.userId,
+        symbol: input.symbol,
+        tradePrice: bestPrice.price,
+        tradeQty,
+        buyerLockedRelease: restingOrder.price * tradeQty,
+      });
+
+      const orderBook = ORDERBOOKS.get(input.symbol);
+      if (!orderBook) {
+        throw new Error("Order book missing");
+      }
+
+      cleanupPriceLevel(orderBook.bids, bestPrice.price);
+    }
+  }
+
+  const remainingQty = order.qty - order.filledQty;
+
+  if (input.type === "market") {
+    if (input.side === "buy") {
+      refundLockedInr(order.userId, marketBuyRemainingSpend);
+    }
+
+    if (input.side === "sell" && remainingQty > 0) {
+      unlockRemainingReservation(order, remainingQty);
+    }
+
+    if (remainingQty > 0 && order.filledQty === 0) {
+      order.status = "cancelled";
+      return order;
+    }
+
+    updateOrderStatus(order);
+    return order;
+  }
+
+  if (remainingQty === 0) {
+    return order;
+  }
+
+  if (input.price === null) {
+    throw new Error("price is required for resting limit orders");
+  }
+
   let orderBook = ORDERBOOKS.get(input.symbol);
   if (!orderBook) {
     orderBook = {
@@ -263,4 +488,115 @@ function bestBidPrice(
     return null;
   }
   return { price: bestPrice, orders: bestOrders };
+}
+
+function updateOrderStatus(order: OrderRecord): void {
+  if (order.filledQty === 0) {
+    order.status = "open";
+    return;
+  }
+
+  if (order.filledQty < order.qty) {
+    order.status = "partially_filled";
+    return;
+  }
+
+  order.status = "filled";
+}
+
+function cleanupPriceLevel(
+  bookSide: Map<number, RestingOrder[]>,
+  price: number,
+): void {
+  const priceLevel = bookSide.get(price);
+
+  if (!priceLevel) return;
+
+  const activeOrders = priceLevel.filter(
+    (order) => order.qty - order.filledQty > 0,
+  );
+
+  if (activeOrders.length === 0) {
+    bookSide.delete(price);
+    return;
+  }
+
+  bookSide.set(price, activeOrders);
+}
+
+function settleFill(params: {
+  buyerUserId: string;
+  sellerUserId: string;
+  symbol: string;
+  tradePrice: number;
+  tradeQty: number;
+  buyerLockedRelease: number;
+}): void {
+  const buyerBalances = getUserBalance(params.buyerUserId);
+  const sellerBalances = getUserBalance(params.sellerUserId);
+
+  const buyerInr = buyerBalances.INR;
+  const buyerAsset = buyerBalances[params.symbol];
+  const sellerInr = sellerBalances.INR;
+  const sellerAsset = sellerBalances[params.symbol];
+
+  if (!buyerInr || !buyerAsset || !sellerInr || !sellerAsset) {
+    throw new Error("Balance missing");
+  }
+
+  const lockedToRelease = params.buyerLockedRelease;
+  const tradeValue = params.tradePrice * params.tradeQty;
+  const refund = lockedToRelease - tradeValue;
+
+  buyerInr.locked -= lockedToRelease;
+  buyerInr.available += refund;
+  buyerAsset.available += params.tradeQty;
+
+  sellerAsset.locked -= params.tradeQty;
+  sellerInr.available += tradeValue;
+}
+
+function unlockRemainingReservation(
+  order: OrderRecord,
+  remainingQty: number,
+): void {
+  const balances = getUserBalance(order.userId);
+
+  if (order.side === "buy") {
+    if (order.price === null) {
+      throw new Error("Buy order price missing");
+    }
+
+    const inrBalance = balances.INR;
+    if (!inrBalance) {
+      throw new Error("INR Balance is missing");
+    }
+
+    const lockedToUnlock = order.price * remainingQty;
+    inrBalance.locked -= lockedToUnlock;
+    inrBalance.available += lockedToUnlock;
+    return;
+  }
+
+  const assetBalance = balances[order.symbol];
+  if (!assetBalance) {
+    throw new Error("Asset Balance is missing");
+  }
+
+  assetBalance.locked -= remainingQty;
+  assetBalance.available += remainingQty;
+}
+
+function refundLockedInr(userId: string, amount: number): void {
+  if (amount <= 0) return;
+
+  const balances = getUserBalance(userId);
+  const inrBalance = balances.INR;
+
+  if (!inrBalance) {
+    throw new Error("INR Balance is missing");
+  }
+
+  inrBalance.locked -= amount;
+  inrBalance.available += amount;
 }

@@ -42,8 +42,9 @@ export interface CreateOrderInput {
   type: OrderType;
   side: Side;
   symbol: string;
-  price: number;
+  price: number | null;
   qty: number;
+  maxSpend?: number;
 }
 
 export interface RestingOrder {

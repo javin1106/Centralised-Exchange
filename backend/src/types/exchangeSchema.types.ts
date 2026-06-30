@@ -8,7 +8,7 @@ export const orderIdParamSchema = z.object({
   orderId: z.string().trim().min(1, "orderId is required"),
 });
 
-export const orderBodySchema = z.discriminatedUnion("type", [
+export const orderBodySchema = z.union([
   z.object({
     type: z.literal("limit"),
     side: z.enum(["buy", "sell"]),
@@ -18,7 +18,15 @@ export const orderBodySchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("market"),
-    side: z.enum(["buy", "sell"]),
+    side: z.literal("buy"),
+    symbol: z.string().trim().min(1, "symbol is required"),
+    price: z.null().optional(),
+    qty: z.number().positive("qty must be a positive number"),
+    maxSpend: z.number().positive("market buy requires a positive maxSpend"),
+  }),
+  z.object({
+    type: z.literal("market"),
+    side: z.literal("sell"),
     symbol: z.string().trim().min(1, "symbol is required"),
     price: z.null().optional(),
     qty: z.number().positive("qty must be a positive number"),

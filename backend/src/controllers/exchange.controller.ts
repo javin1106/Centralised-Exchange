@@ -42,7 +42,28 @@ export async function cancelOrder(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  res.status(501).json({ error: "Cancellation not implemented" });
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+
+  const engineResponse = await sendToEngine("cancel_order", {
+    userId,
+    orderId: result.data.orderId,
+  });
+
+  const statusCode = engineResponse.ok
+    ? 200
+    : engineResponse.error === "Order not found"
+      ? 404
+      : 400;
+
+  res
+    .status(statusCode)
+    .json(
+      engineResponse.ok ? engineResponse.data : { error: engineResponse.error },
+    );
 }
 
 export async function getOrders(req: Request, res: Response): Promise<void> {

@@ -8,6 +8,7 @@ import {
   getUserOrders,
   getFills,
   createOrder,
+  cancelOrder,
 } from "./services/exchange.service.js";
 
 type EngineCommandType =
@@ -58,25 +59,34 @@ async function sendResponse(
 function handleEngineRequest(message: EngineRequest): unknown {
   switch (message.type) {
     case "create_order": {
-      const { userId, type, side, symbol, price, qty } = message.payload;
+      const { userId, type, side, symbol, price, qty, maxSpend } =
+        message.payload;
       if (typeof userId !== "string") throw new Error("userId is required");
-      if (type !== "limit") {
-        throw new Error("Market orders are not implemented yet");
+      if (type !== "limit" && type !== "market") {
+        throw new Error("type is invalid");
       }
       if (side !== "buy" && side !== "sell") throw new Error("side is invalid");
       if (typeof symbol !== "string") throw new Error("symbol is required");
       if (typeof qty !== "number") throw new Error("qty is required");
-      if (typeof price !== "number") {
+
+      if (type === "limit" && typeof price !== "number") {
         throw new Error("price is required for limit orders");
       }
+
+      if (type === "market" && side === "buy" && typeof maxSpend !== "number") {
+        throw new Error("maxSpend is required for market buy orders");
+      }
+
+      const orderPrice = type === "limit" ? (price as number) : null;
 
       return createOrder({
         userId,
         type,
         side,
         symbol,
-        price,
+        price: orderPrice,
         qty,
+        ...(typeof maxSpend === "number" ? { maxSpend } : {}),
       });
     }
 
@@ -134,8 +144,20 @@ function handleEngineRequest(message: EngineRequest): unknown {
       return getFills(symbol);
     }
 
-    case "cancel_order":
-      throw new Error("Cancel order not implemented yet");
+    case "cancel_order": {
+      const userId = message.payload.userId;
+      const orderId = message.payload.orderId;
+
+      if (typeof userId !== "string") {
+        throw new Error("userId is required");
+      }
+
+      if (typeof orderId !== "string") {
+        throw new Error("orderId is required");
+      }
+
+      return cancelOrder(userId, orderId);
+    }
 
     case "get_stocks":
       return getStocks();
